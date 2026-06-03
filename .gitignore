@@ -1,0 +1,30 @@
+.idea
+__pycache__
+*.pyc
+*.sqlite
+*.db
+build/
+dist/
+*.egg-info/
+*.log
+*.db-shm
+*.db-wal
+.env
+logs/
+.deta
+.pytest_cache
+venv/
+doc/build/
+
+# 数据缓存（体积大，新服务器重新下载）
+data_cache/
+
+# 生成的图表和CSV输出
+output/
+*.png
+intraday_t_daily.csv
+intraday_t_daily_trades.csv
+
+# RL 训练中间产物（模型文件保留pkl，排除sb3的zip）
+rl/__pycache__/
+rl/models/*.zip
