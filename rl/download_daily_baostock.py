@@ -14,10 +14,6 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-_VENV_PYTHON = os.path.join(os.path.dirname(os.path.dirname(__file__)), "venv", "bin", "python")
-if sys.executable != _VENV_PYTHON and os.path.exists(_VENV_PYTHON):
-    os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
-
 import baostock as bs
 import pandas as pd
 
@@ -38,27 +34,41 @@ def bs_code_to_plain(code):
     return code.split(".")[1]
 
 
-def download_daily(code, start_date, end_date):
-    """下载单只股票日K线，返回 DataFrame。"""
-    rs = bs.query_history_k_data_plus(
-        code,
-        "date,code,open,high,low,close,volume,amount,turn,pctChg,peTTM,pbMRQ",
-        start_date=start_date,
-        end_date=end_date,
-        frequency="d",
-        adjustflag="2",  # 前复权
-    )
-    rows = []
-    while rs.error_code == "0" and rs.next():
-        rows.append(rs.get_row_data())
+def download_daily(code, start_date, end_date, timeout=60):
+    """下载单只股票日K线，返回 DataFrame。timeout秒无响应则放弃。"""
+    import signal
+
+    def _timeout_handler(signum, frame):
+        raise TimeoutError("baostock query timeout after {}s".format(timeout))
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)
+    try:
+        rs = bs.query_history_k_data_plus(
+            code,
+            "date,code,open,high,low,close,preclose,volume,amount,turn,"
+            "tradestatus,pctChg,peTTM,pbMRQ,isST",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2",  # 前复权
+        )
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+    finally:
+        signal.alarm(0)
     if not rows:
         return None
     df = pd.DataFrame(rows, columns=rs.fields)
     # 转换数值类型
-    for col in ["open", "high", "low", "close", "volume", "amount",
+    for col in ["open", "high", "low", "close", "preclose", "volume", "amount",
                 "turn", "pctChg", "peTTM", "pbMRQ"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["tradestatus", "isST"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     df["date"] = pd.to_datetime(df["date"])
     df = df.dropna(subset=["open", "high", "low", "close"])
     df = df[df["close"] > 0]
@@ -88,12 +98,6 @@ def main():
         plain = bs_code_to_plain(code)
         cache_path = os.path.join(CACHE_DIR, f"daily_{plain}.parquet")
 
-        # 已有缓存则跳过
-        if os.path.exists(cache_path):
-            print(f"  [{i+1:3d}/{len(symbols)}] {plain} 已缓存，跳过")
-            success.append(plain)
-            continue
-
         print(f"  [{i+1:3d}/{len(symbols)}] {plain} 下载中...", end=" ", flush=True)
         try:
             df = download_daily(code, args.start, args.end)
@@ -104,6 +108,9 @@ def main():
             df.to_parquet(cache_path, index=False)
             print(f"OK ({len(df)} 天)")
             success.append(plain)
+        except TimeoutError:
+            print("TIMEOUT (跳过)")
+            failed.append(plain)
         except Exception as e:
             print(f"FAIL: {e}")
             failed.append(plain)

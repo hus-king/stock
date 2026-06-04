@@ -15,6 +15,7 @@ if sys.executable != _VENV_PYTHON and os.path.exists(_VENV_PYTHON):
     os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
 
 import glob
+import multiprocessing as mp
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
@@ -27,7 +28,7 @@ from stock_open_api.simulation.data import MinuteDataLoader
 from stock_open_api.simulation.engine import SimulationEngine
 from stock_open_api.simulation.strategy import GridStrategy
 
-START_DATE = "2026-04-01"
+START_DATE = "2024-01-15"
 END_DATE   = "2026-06-01"
 EARLY_BARS = 6
 
@@ -37,15 +38,61 @@ COMMISSION  = 0.0003
 MIN_COMM    = 5.0
 STAMP_TAX   = 0.001
 
+# 预筛阈值：近60个交易日
+SCREEN_AMP_MIN    = 0.02   # 日均振幅 > 2%
+SCREEN_TURN_MIN   = 0.01   # 日均换手率 > 1%
+SCREEN_LOOKBACK   = 60     # 用最近60个交易日统计
+
 STRATEGY_CONFIG = {
     "grid_spacing": 0.015,
     "grid_levels": 3,
     "lot_size": 300,
     "base_price_source": "open",
-    "trend_filter_enabled": False,
+    "trend_filter_enabled": False,  # 关闭：让ML自己学趋势过滤，避免双重过滤污染标签
+    "trend_ma_period": 20,
     "max_daily_net_buy": 600,
-    "daily_loss_limit": -9999,
+    "daily_loss_limit": -1000,      # 与推理环境一致
 }
+
+
+# ============================================================
+# 日K线加载与预筛
+# ============================================================
+
+def load_daily(symbol):
+    """加载日K线，返回按日期排序的 DataFrame，index 为 date。"""
+    path = os.path.join("data_cache", "daily", f"daily_{symbol}.parquet")
+    if not os.path.exists(path):
+        return None
+    df = pd.read_parquet(path)
+    df = df.set_index("date").sort_index()
+    # 去掉股票代码前缀 sz./sh.
+    if "code" in df.columns:
+        df = df.drop(columns=["code"])
+    return df
+
+
+def screen_symbols_by_daily(all_daily_symbols, lookback=SCREEN_LOOKBACK):
+    """用日K线筛选活跃标的（振幅+换手），排除ST和长期停牌，返回通过筛选的股票代码列表。"""
+    passed = []
+    for sym in all_daily_symbols:
+        df = load_daily(sym)
+        if df is None or len(df) < lookback:
+            continue
+        # 排除ST股
+        if "isST" in df.columns and df["isST"].iloc[-1] == 1:
+            continue
+        recent = df.iloc[-lookback:]
+        # 排除近期有大量停牌的股票（停牌天数超过20%）
+        if "tradestatus" in df.columns:
+            trade_ratio = (recent["tradestatus"] == 1).mean()
+            if trade_ratio < 0.8:
+                continue
+        avg_amp  = ((recent["high"] - recent["low"]) / recent["open"]).mean()
+        avg_turn = recent["turn"].mean() / 100.0
+        if avg_amp >= SCREEN_AMP_MIN and avg_turn >= SCREEN_TURN_MIN:
+            passed.append(sym)
+    return passed
 
 
 # ============================================================
@@ -60,26 +107,122 @@ def run_backtest(symbol, data):
         stamp_tax=STAMP_TAX, fill_policy="next_open",
     )
     engine.run(data, strategy)
-    daily_t = {}
-    for d in engine.daily_stats_list:
-        date = d["date"]
-        day_trades = [t for t in engine.trades
-                      if hasattr(t.timestamp, "date")
-                      and t.timestamp.date() == date
-                      and t.tag != "closeout"]
-        t_cash = sum(
-            t.quantity * t.price * (-1 if t.side == "BUY" else 1) - t.commission
-            for t in day_trades
-        )
-        daily_t[date] = t_cash
+    # 直接使用引擎记录的每日T净贡献（daily_pnl - 底仓浮盈）
+    daily_t = {d["date"]: d["t_pnl"] for d in engine.daily_stats_list}
     return daily_t
 
 
 # ============================================================
-# 特征提取（早盘 + 昨日 + 近5日）
+# 日K线衍生特征（开盘前已知，无未来泄露）
 # ============================================================
 
-def extract_features(day_bars, prev_days_list, open_price):
+def extract_daily_features(daily_df, target_date):
+    """
+    基于日K线计算截止昨日的衍生特征。
+    target_date: 当天日期（datetime.date）
+    返回 dict 或 None。
+    """
+    ts = pd.Timestamp(target_date)
+    hist = daily_df[daily_df.index < ts]
+
+    # 过滤停牌日
+    if "tradestatus" in hist.columns:
+        hist = hist[hist["tradestatus"] == 1]
+
+    if len(hist) < 20:
+        return None
+
+    recent5  = hist.iloc[-5:]
+    recent10 = hist.iloc[-10:]
+    recent20 = hist.iloc[-20:]
+
+    closes  = recent20["close"].values.astype(float)
+    opens20 = recent20["open"].values.astype(float)
+    highs20 = recent20["high"].values.astype(float)
+    lows20  = recent20["low"].values.astype(float)
+    vols20  = recent20["volume"].values.astype(float)
+
+    # 近5/20日日均振幅
+    amp20 = ((highs20 - lows20) / (opens20 + 1e-8)).mean()
+    amp5  = ((recent5["high"].values - recent5["low"].values) /
+             (recent5["open"].values + 1e-8)).mean()
+
+    # 昨日成交量相对近20日 z-score
+    vol_mean = vols20.mean()
+    vol_std  = vols20.std() + 1e-8
+    vol_zscore = (float(hist.iloc[-1]["volume"]) - vol_mean) / vol_std
+
+    # 近10日收盘价线性斜率（归一化）
+    x = np.arange(len(recent10))
+    c10 = recent10["close"].values.astype(float)
+    trend_slope = np.polyfit(x, c10, 1)[0] / (c10.mean() + 1e-8)
+
+    # 连续同向天数（连涨为正，连跌为负）
+    rets = np.diff(closes)
+    consec = 0
+    if len(rets) > 0:
+        last_dir = np.sign(rets[-1])
+        for r in reversed(rets):
+            if np.sign(r) == last_dir and r != 0:
+                consec += int(last_dir)
+            else:
+                break
+
+    # 近5日换手率均值
+    turn_ma5 = float(recent5["turn"].mean()) / 100.0
+
+    # 距近20日最高价的距离（负值=在最高价下方）
+    high20 = highs20.max()
+    last_close = float(hist.iloc[-1]["close"])
+    high_dist = (last_close - high20) / (high20 + 1e-8)
+
+    # PE分位（滚动近2年窗口，避免历史长度不一致导致分位漂移）
+    ROLL_WINDOW = 500  # 约2年交易日
+    pe_rank = 0.5
+    if "peTTM" in hist.columns:
+        pe_series = hist["peTTM"].dropna()
+        if len(pe_series) > 10:
+            roll = pe_series.iloc[-ROLL_WINDOW:]
+            cur_pe = float(hist.iloc[-1].get("peTTM", np.nan))
+            if not np.isnan(cur_pe):
+                pe_rank = float((roll < cur_pe).mean())
+
+    # PB分位（同上，滚动近2年窗口）
+    pb_rank = 0.5
+    if "pbMRQ" in hist.columns:
+        pb_series = hist["pbMRQ"].dropna()
+        if len(pb_series) > 10:
+            roll = pb_series.iloc[-ROLL_WINDOW:]
+            cur_pb = float(hist.iloc[-1].get("pbMRQ", np.nan))
+            if not np.isnan(cur_pb):
+                pb_rank = float((roll < cur_pb).mean())
+
+    # 用 preclose 计算精确跳空幅度（比5分钟数据更准）
+    gap_preclose = 0.0
+    if "preclose" in hist.columns:
+        preclose = float(hist.iloc[-1]["preclose"])
+        if preclose > 0:
+            gap_preclose = (last_close - preclose) / preclose
+
+    return {
+        "daily_amp_ma5":      float(amp5),
+        "daily_amp_ma20":     float(amp20),
+        "daily_vol_zscore":   float(vol_zscore),
+        "daily_trend_slope":  float(trend_slope),
+        "daily_consec_dir":   float(consec),
+        "daily_turn_ma5":     float(turn_ma5),
+        "daily_high_dist":    float(high_dist),
+        "daily_pe_rank":      float(pe_rank),
+        "daily_pb_rank":      float(pb_rank),
+        "daily_gap_preclose": float(gap_preclose),
+    }
+
+
+# ============================================================
+# 早盘特征提取（原有18维）
+# ============================================================
+
+def extract_features(day_bars, prev_days_list, open_price, daily_df=None, target_date=None):
     if len(day_bars) < EARLY_BARS or open_price <= 0:
         return None
 
@@ -87,14 +230,14 @@ def extract_features(day_bars, prev_days_list, open_price):
     closes  = morning["close"].values.astype(float)
     vols    = morning["volume"].values.astype(float)
 
-    m_high = float(morning["high"].max())
-    m_low  = float(morning["low"].min())
+    m_high  = float(morning["high"].max())
+    m_low   = float(morning["low"].min())
     m_close = float(morning.iloc[-1]["close"])
-    x = np.arange(len(closes))
-    slope = np.polyfit(x, closes, 1)[0] / open_price if len(closes) > 1 else 0.0
-    rets  = np.diff(closes) / (closes[:-1] + 1e-8)
-    vol_mean_per_bar = float(day_bars["volume"].mean()) + 1e-8
-    vwap  = np.sum(closes * vols) / (vols.sum() + 1e-8)
+    x       = np.arange(len(closes))
+    slope   = np.polyfit(x, closes, 1)[0] / open_price if len(closes) > 1 else 0.0
+    rets    = np.diff(closes) / (closes[:-1] + 1e-8)
+    vol_mean_per_bar = float(morning["volume"].mean()) + 1e-8
+    vwap    = np.sum(closes * vols) / (vols.sum() + 1e-8)
 
     feats = {
         "m_amplitude":  (m_high - m_low) / open_price,
@@ -109,6 +252,7 @@ def extract_features(day_bars, prev_days_list, open_price):
         "m_vwap_dev":   (vwap - open_price) / open_price,
     }
 
+    # 原有跨日特征（基于5分钟缓存）
     if prev_days_list:
         prev = prev_days_list[-1]
         p_open  = float(prev.iloc[0]["open"])
@@ -128,11 +272,11 @@ def extract_features(day_bars, prev_days_list, open_price):
     n_hist = min(5, len(prev_days_list))
     if n_hist >= 2:
         hist = prev_days_list[-n_hist:]
-        amps = [(float(p["high"].max()) - float(p["low"].min())) /
-                (float(p.iloc[0]["open"]) + 1e-8) for p in hist]
+        amps   = [(float(p["high"].max()) - float(p["low"].min())) /
+                  (float(p.iloc[0]["open"]) + 1e-8) for p in hist]
         rets_h = [(float(p.iloc[-1]["close"]) - float(p.iloc[0]["open"])) /
                   (float(p.iloc[0]["open"]) + 1e-8) for p in hist]
-        hvols = [float(p["volume"].mean()) for p in hist]
+        hvols  = [float(p["volume"].mean()) for p in hist]
         feats.update({
             "hist_amp_mean":  float(np.mean(amps)),
             "hist_amp_std":   float(np.std(amps)),
@@ -143,39 +287,132 @@ def extract_features(day_bars, prev_days_list, open_price):
     else:
         feats.update({"hist_amp_mean": feats["m_amplitude"], "hist_amp_std": 0.0,
                       "hist_ret_mean": 0.0, "hist_vol_trend": 0.0})
+
+    # 新增：日K线衍生特征
+    if daily_df is not None and target_date is not None:
+        df_feats = extract_daily_features(daily_df, target_date)
+        if df_feats:
+            feats.update(df_feats)
+        else:
+            feats.update({
+                "daily_amp_ma5": feats["m_amplitude"], "daily_amp_ma20": feats["m_amplitude"],
+                "daily_vol_zscore": 0.0, "daily_trend_slope": 0.0,
+                "daily_consec_dir": 0.0, "daily_turn_ma5": 0.0,
+                "daily_high_dist": 0.0, "daily_pe_rank": 0.5,
+                "daily_pb_rank": 0.5, "daily_gap_preclose": 0.0,
+            })
+    else:
+        feats.update({
+            "daily_amp_ma5": feats["m_amplitude"], "daily_amp_ma20": feats["m_amplitude"],
+            "daily_vol_zscore": 0.0, "daily_trend_slope": 0.0,
+            "daily_consec_dir": 0.0, "daily_turn_ma5": 0.0,
+            "daily_high_dist": 0.0, "daily_pe_rank": 0.5,
+            "daily_pb_rank": 0.5, "daily_gap_preclose": 0.0,
+        })
+
     return feats
 
 
 # ============================================================
-# 构建数据集
+# 构建数据集（单股处理函数，供进程池调用）
 # ============================================================
 
-def build_dataset(symbols, start_date, end_date):
-    loader = MinuteDataLoader(cache_dir="data_cache")
+def _has_minute_cache(symbol, cache_dir="data_cache"):
+    """检查是否有该股票的任意5分钟缓存文件（不触发网络请求）。"""
+    import glob as _glob
+    pattern = os.path.join(cache_dir, "min_{}_*.parquet".format(symbol))
+    return len(_glob.glob(pattern)) > 0
+
+
+def _load_baostock_cache(symbol, start_date, end_date, cache_dir="data_cache"):
+    """直接从 baostock parquet 缓存加载5分钟数据，过滤日期范围。"""
+    import hashlib
+    for s, e in [("2024-01-01", "2026-06-01"), ("2026-01-01", "2026-06-01")]:
+        key = "{}|{}|{}|5|baostock".format(symbol, s, e)
+        h = hashlib.md5(key.encode()).hexdigest()[:8]
+        path = os.path.join(cache_dir, "min_{}_{}.parquet".format(symbol, h))
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            if "date" not in df.columns:
+                df["date"] = df.index.date
+            # 过滤到请求的日期范围
+            start_dt = pd.to_datetime(start_date).date()
+            end_dt   = pd.to_datetime(end_date).date()
+            df = df[df["date"].between(start_dt, end_dt)]
+            if len(df) > 0:
+                return df
+    return None
+
+
+def _process_symbol(args):
+    """单只股票的回测+特征提取，返回 (feats_list, labels_list, meta_list)。"""
+    sym, start_date, end_date = args
+
+    # 只使用本地已有缓存，跳过无缓存股票（避免触发网络下载）
+    if not _has_minute_cache(sym):
+        return [], [], []
+
+    # 优先直接读 baostock 缓存（避免 MinuteDataLoader 触发网络请求）
+    data = _load_baostock_cache(sym, start_date, end_date)
+    if data is None:
+        try:
+            loader = MinuteDataLoader(cache_dir="data_cache")
+            data = loader.load(sym, start_date, end_date, "5", "qfq")
+        except Exception:
+            return [], [], []
+    if data is None or len(data) == 0:
+        return [], [], []
+
+    if "date" not in data.columns:
+        data = data.copy()
+        data["date"] = data.index.date
+
+    daily_df = load_daily(sym)
+
+    try:
+        t_pnl = run_backtest(sym, data)
+    except Exception:
+        return [], [], []
+
+    dates = sorted(data["date"].unique())
+    day_bars_list = [data[data["date"] == d].reset_index() for d in dates]
+
+    feats_list, labels_list, meta_list = [], [], []
+    for i, (date, day_bars) in enumerate(zip(dates, day_bars_list)):
+        open_price = float(day_bars.iloc[0]["open"]) if len(day_bars) > 0 else 0
+        feats = extract_features(
+            day_bars,
+            day_bars_list[max(0, i - 5):i],
+            open_price,
+            daily_df=daily_df,
+            target_date=date,
+        )
+        if feats is None or date not in t_pnl:
+            continue
+        feats_list.append(feats)
+        labels_list.append(1 if t_pnl[date] > 0 else 0)
+        meta_list.append({"symbol": sym, "date": date, "t_pnl": t_pnl[date]})
+
+    return feats_list, labels_list, meta_list
+
+
+def build_dataset(symbols, start_date, end_date, n_jobs=None):
+    if n_jobs is None:
+        n_jobs = max(1, mp.cpu_count() - 2)
+
+    args = [(sym, start_date, end_date) for sym in symbols]
     all_feats, labels, meta = [], [], []
 
-    for sym in symbols:
-        try:
-            data = loader.load(sym, start_date, end_date, "5", "qfq")
-        except Exception as e:
-            print(f"  跳过 {sym}: {e}")
-            continue
-        if "date" not in data.columns:
-            data = data.copy()
-            data["date"] = data.index.date
-
-        t_pnl = run_backtest(sym, data)
-        dates = sorted(data["date"].unique())
-        day_bars_list = [data[data["date"] == d].reset_index() for d in dates]
-
-        for i, (date, day_bars) in enumerate(zip(dates, day_bars_list)):
-            open_price = float(day_bars.iloc[0]["open"]) if len(day_bars) > 0 else 0
-            feats = extract_features(day_bars, day_bars_list[max(0, i-5):i], open_price)
-            if feats is None or date not in t_pnl:
-                continue
-            all_feats.append(feats)
-            labels.append(1 if t_pnl[date] > 0 else 0)
-            meta.append({"symbol": sym, "date": date, "t_pnl": t_pnl[date]})
+    print(f"并行处理 {len(symbols)} 只股票，使用 {n_jobs} 个进程...")
+    with mp.Pool(processes=n_jobs) as pool:
+        for i, (f_list, l_list, m_list) in enumerate(
+            pool.imap_unordered(_process_symbol, args), 1
+        ):
+            all_feats.extend(f_list)
+            labels.extend(l_list)
+            meta.extend(m_list)
+            if i % 10 == 0 or i == len(symbols):
+                print(f"  {i}/{len(symbols)} 只完成，当前样本数: {len(labels)}")
 
     return pd.DataFrame(all_feats), np.array(labels), pd.DataFrame(meta)
 
@@ -185,20 +422,22 @@ def build_dataset(symbols, start_date, end_date):
 # ============================================================
 
 def train(df_feat, labels, df_meta, train_ratio=0.8):
-    dates   = df_meta["date"].values
-    cutoff  = sorted(set(dates))[int(len(set(dates)) * train_ratio)]
-    tr, te  = dates < cutoff, dates >= cutoff
+    dates  = df_meta["date"].values
+    cutoff = sorted(set(dates))[int(len(set(dates)) * train_ratio)]
+    tr, te = dates < cutoff, dates >= cutoff
 
-    scaler  = StandardScaler()
-    X_tr_s  = scaler.fit_transform(df_feat[tr].values)
-    X_te_s  = scaler.transform(df_feat[te].values)
+    scaler   = StandardScaler()
+    X_tr_s   = scaler.fit_transform(df_feat[tr].values)
+    X_te_s   = scaler.transform(df_feat[te].values)
     y_tr, y_te = labels[tr], labels[te]
 
+    n_jobs = max(1, mp.cpu_count() - 2)
     model = XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
         scale_pos_weight=(y_tr == 0).sum() / max((y_tr == 1).sum(), 1),
         random_state=42, eval_metric="logloss", verbosity=0,
+        nthread=n_jobs,
     )
     model.fit(X_tr_s, y_tr, eval_set=[(X_te_s, y_te)], verbose=False)
 
@@ -215,18 +454,24 @@ def train(df_feat, labels, df_meta, train_ratio=0.8):
         pass
 
     feat_imp = sorted(zip(df_feat.columns, model.feature_importances_), key=lambda x: -x[1])
-    print("\n特征重要性:")
-    for name, imp in feat_imp:
-        print(f"  {name:25s}: {imp:.4f}")
+    print("\n特征重要性 (top 15):")
+    for name, imp in feat_imp[:15]:
+        print(f"  {name:28s}: {imp:.4f}")
 
-    # 择日效果对比
+    # 择日效果对比（注意：这是标签层的后验估计，不是真实回测）
+    # t_pnl = daily_pnl - (close-open)*base_shares，即当天T操作的净贡献
+    # 此处直接对测试集标签求和，相当于"如果完美知道哪天T净贡献为正"的理论上限
+    # 真实效果请用 compare_monthly.py 验证
     test_meta = df_meta[te].copy()
     test_meta["pred"] = y_pred
     all_t = test_meta["t_pnl"].sum()
     ml_t  = test_meta[test_meta["pred"] == 1]["t_pnl"].sum()
-    n_reduced = te.sum() - (test_meta["pred"] == 1).sum()
-    print(f"\n[回测对比] 全天做T: {all_t:,.0f}元  ML择日: {ml_t:,.0f}元  "
-          f"减少交易: {n_reduced}/{te.sum()} 天")
+    n_all = te.sum()
+    n_ml  = (test_meta["pred"] == 1).sum()
+    print(f"\n[标签层估计（后验，非真实回测）]")
+    print(f"全天做T: {all_t:,.0f}元({n_all}天)  "
+          f"ML择日: {ml_t:,.0f}元({n_ml}天)  "
+          f"减少交易: {n_all - n_ml}/{n_all} 天")
 
     return model, scaler
 
@@ -236,20 +481,48 @@ def train(df_feat, labels, df_meta, train_ratio=0.8):
 # ============================================================
 
 def main():
-    files   = glob.glob("data_cache/min_*.parquet")
-    symbols = sorted(set(os.path.basename(f).split("_")[1] for f in files))
-    print(f"共 {len(symbols)} 只股票，{START_DATE} ~ {END_DATE}\n")
+    # 1. 从日K线里找出所有300只股票代码
+    daily_files = glob.glob("data_cache/daily/daily_*.parquet")
+    all_daily_syms = sorted(
+        os.path.basename(f).replace("daily_", "").replace(".parquet", "")
+        for f in daily_files
+    )
+    print(f"日K线覆盖: {len(all_daily_syms)} 只股票")
 
+    # 2. 预筛：振幅+换手率
+    print(f"预筛条件：近{SCREEN_LOOKBACK}日均振幅>{SCREEN_AMP_MIN:.0%}  "
+          f"均换手率>{SCREEN_TURN_MIN:.0%} ...")
+    active_syms = screen_symbols_by_daily(all_daily_syms)
+    print(f"预筛通过: {len(active_syms)} 只\n")
+
+    # 3. 和已有5分钟缓存取并集（缓存里有的即使不在预筛里也保留）
+    min_files = glob.glob("data_cache/min_*.parquet")
+    cached_syms = sorted(set(os.path.basename(f).split("_")[1] for f in min_files))
+    symbols = sorted(set(active_syms) | set(cached_syms))
+    in_both = len(set(active_syms) & set(cached_syms))
+    print(f"5分钟缓存: {len(cached_syms)} 只  预筛通过: {len(active_syms)} 只  "
+          f"两者交集: {in_both} 只")
+    print(f"训练股票池: {len(symbols)} 只（仅使用有本地缓存的，跳过网络下载）")
+    print(f"日期: {START_DATE} ~ {END_DATE}\n")
+
+    # 4. 构建数据集
     df_feat, labels, df_meta = build_dataset(symbols, START_DATE, END_DATE)
-    print(f"总样本: {len(labels)}  正样本: {labels.sum()} ({labels.mean():.1%})")
+    if len(labels) == 0:
+        print("没有有效样本，退出。")
+        return
+    print(f"\n总样本: {len(labels)}  正样本: {labels.sum()} ({labels.mean():.1%})")
+    print(f"特征维度: {df_feat.shape[1]}  特征: {df_feat.columns.tolist()}")
 
+    # 5. 训练
     model, scaler = train(df_feat, labels, df_meta)
 
+    # 6. 保存
     import joblib
     os.makedirs("rl/models", exist_ok=True)
-    joblib.dump({"model": model, "scaler": scaler,
-                 "features": df_feat.columns.tolist()},
-                "rl/models/ml_selector.pkl")
+    joblib.dump(
+        {"model": model, "scaler": scaler, "features": df_feat.columns.tolist()},
+        "rl/models/ml_selector.pkl",
+    )
     print("\n模型已保存到 rl/models/ml_selector.pkl")
 
 

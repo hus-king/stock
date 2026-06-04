@@ -16,8 +16,8 @@ logs/
 venv/
 doc/build/
 
-# 数据缓存（直接提交到git）
-# data_cache/
+# 数据缓存（体积大，不提交）
+data_cache/
 
 # 生成的图表和CSV输出
 output/
@@ -28,3 +28,7 @@ intraday_t_daily_trades.csv
 # RL 训练中间产物（模型文件保留pkl，排除sb3的zip）
 rl/__pycache__/
 rl/models/*.zip
+
+# 临时测试脚本
+rl/_test_*.py
+rl/_compare_*.py

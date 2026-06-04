@@ -129,15 +129,22 @@ class SimulationEngine:
             # Record daily stats
             day_end_value = self._account_value(closeout_price)
             day_pnl = day_end_value - day_start_value
+            open_price = float(day_bars.iloc[0]["open"])
+            # T净贡献 = 今日总收益 - 若只持有底仓（base_shares）的浮盈
+            # 每天收盘都 closeout 回 base_shares，所以用 base_shares 作为基准
+            bah_pnl_day = (closeout_price - open_price) * self.base_shares
+            t_pnl_day = day_pnl - bah_pnl_day
             daily = {
                 "date": day,
-                "open_price": float(day_bars.iloc[0]["open"]),
+                "open_price": open_price,
                 "close_price": closeout_price,
                 "high": float(day_bars["high"].max()),
                 "low": float(day_bars["low"].min()),
                 "num_trades": len([t for t in day_trades if t.tag != "closeout"]),
                 "num_closeout": len([t for t in day_trades if t.tag == "closeout"]),
                 "daily_pnl": day_pnl,
+                "t_pnl": t_pnl_day,
+                "bah_pnl": bah_pnl_day,
                 "daily_pnl_pct": day_pnl / day_start_value if day_start_value > 0 else 0,
                 "buy_volume": sum(t.quantity for t in day_trades if t.side == "BUY"),
                 "sell_volume": sum(t.quantity for t in day_trades if t.side == "SELL"),
