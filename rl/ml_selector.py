@@ -10,9 +10,18 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# 强制行缓冲，确保管道输出实时可见
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
 _VENV_PYTHON = os.path.join(os.path.dirname(os.path.dirname(__file__)), "venv", "bin", "python")
 if sys.executable != _VENV_PYTHON and os.path.exists(_VENV_PYTHON):
-    os.execv(_VENV_PYTHON, [_VENV_PYTHON] + sys.argv)
+    # 保留 -u 标志，避免 exec 后输出缓冲
+    args = [_VENV_PYTHON]
+    if "-u" in sys.argv or "-u" in sys.orig_argv if hasattr(sys, "orig_argv") else False:
+        args.append("-u")
+    args.extend(sys.argv)
+    os.execv(_VENV_PYTHON, args)
 
 import glob
 import multiprocessing as mp
@@ -31,6 +40,8 @@ from stock_open_api.simulation.strategy import GridStrategy
 START_DATE = "2024-01-15"
 END_DATE   = "2026-06-01"
 EARLY_BARS = 6
+LABEL_THRESHOLD = 50   # t_pnl > 50 元才是正样本；|t_pnl| <= 50 的排除（排除噪音）
+CV_FOLDS = 5           # 时间序列交叉验证折数
 
 BASE_SHARES = 5000
 START_CASH  = 100_000
@@ -389,9 +400,12 @@ def _process_symbol(args):
         )
         if feats is None or date not in t_pnl:
             continue
+        pnl = t_pnl[date]
+        if abs(pnl) <= LABEL_THRESHOLD:
+            continue  # 排除噪音样本：|t_pnl| <= 50 元
         feats_list.append(feats)
-        labels_list.append(1 if t_pnl[date] > 0 else 0)
-        meta_list.append({"symbol": sym, "date": date, "t_pnl": t_pnl[date]})
+        labels_list.append(1 if pnl > 0 else 0)
+        meta_list.append({"symbol": sym, "date": date, "t_pnl": pnl})
 
     return feats_list, labels_list, meta_list
 
@@ -421,35 +435,139 @@ def build_dataset(symbols, start_date, end_date, n_jobs=None):
 # 训练与评估
 # ============================================================
 
-def train(df_feat, labels, df_meta, train_ratio=0.8):
-    dates  = df_meta["date"].values
-    cutoff = sorted(set(dates))[int(len(set(dates)) * train_ratio)]
-    tr, te = dates < cutoff, dates >= cutoff
-
-    scaler   = StandardScaler()
-    X_tr_s   = scaler.fit_transform(df_feat[tr].values)
-    X_te_s   = scaler.transform(df_feat[te].values)
-    y_tr, y_te = labels[tr], labels[te]
-
-    n_jobs = max(1, mp.cpu_count() - 2)
+def _train_one_model(X_tr, y_tr, X_te, y_te, n_jobs):
+    """训练单个 XGBoost 模型，返回 (model, y_prob)。"""
+    scale_pos_weight = (y_tr == 0).sum() / max((y_tr == 1).sum(), 1)
     model = XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=(y_tr == 0).sum() / max((y_tr == 1).sum(), 1),
+        scale_pos_weight=scale_pos_weight,
         random_state=42, eval_metric="logloss", verbosity=0,
         nthread=n_jobs,
     )
-    model.fit(X_tr_s, y_tr, eval_set=[(X_te_s, y_te)], verbose=False)
+    model.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+    y_prob = model.predict_proba(X_te)[:, 1]
+    return model, y_prob
 
-    y_pred = model.predict(X_te_s)
-    y_prob = model.predict_proba(X_te_s)[:, 1]
 
-    print(f"\n训练集: {tr.sum()} 天  测试集: {te.sum()} 天")
-    print(f"正样本比例 - 训练: {y_tr.mean():.1%}  测试: {y_te.mean():.1%}")
-    print("\n分类报告:")
-    print(classification_report(y_te, y_pred, target_names=["不做T", "做T"]))
+def train(df_feat, labels, df_meta, n_folds=None):
+    """时间序列交叉验证 + 全量数据训练最终模型。"""
+    if n_folds is None:
+        n_folds = CV_FOLDS
+
+    # 按日期排序
+    dates = df_meta["date"].values
+    sort_idx = np.argsort(dates)
+    X_all = df_feat.values[sort_idx]
+    y_all = labels[sort_idx]
+    d_all = dates[sort_idx]
+
+    unique_dates = sorted(set(d_all))
+    n_dates = len(unique_dates)
+
+    # 将日期等分为 n_folds+1 段，每折测试集为一段
+    fold_size = n_dates // (n_folds + 1)
+    if fold_size < 1:
+        print(f"错误：日期数 {n_dates} 不足以做 {n_folds} 折交叉验证")
+        return None, None
+
+    n_jobs = max(1, mp.cpu_count() - 2)
+
+    print(f"\n{'='*60}")
+    print(f"时间序列交叉验证 ({n_folds}折)  |  标签阈值: t_pnl > {LABEL_THRESHOLD}")
+    print(f"{'='*60}")
+
+    cv_results = []
+    for fold in range(n_folds):
+        # 测试集：倒数第 (n_folds - fold) 段
+        test_start_rank = n_dates - (n_folds - fold) * fold_size
+        test_end_rank   = min(n_dates, test_start_rank + fold_size)
+        test_start_date = unique_dates[test_start_rank]
+        test_end_date   = unique_dates[test_end_rank - 1]
+
+        te_mask = (d_all >= test_start_date) & (d_all < test_end_date)
+        tr_mask = d_all < test_start_date
+
+        if te_mask.sum() == 0 or tr_mask.sum() == 0:
+            continue
+
+        X_tr_raw, X_te_raw = X_all[tr_mask], X_all[te_mask]
+        y_tr, y_te = y_all[tr_mask], y_all[te_mask]
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr_raw)
+        X_te_s = scaler.transform(X_te_raw)
+
+        model, y_prob = _train_one_model(X_tr_s, y_tr, X_te_s, y_te, n_jobs)
+        y_pred = (y_prob >= 0.5).astype(int)
+
+        acc  = (y_pred == y_te).mean()
+        prec = (y_pred[y_pred == 1] == y_te[y_pred == 1]).mean() if y_pred.sum() > 0 else 0
+        rec  = (y_te[y_te == 1] == y_pred[y_te == 1]).mean() if y_te.sum() > 0 else 0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+        try:
+            auc = roc_auc_score(y_te, y_prob)
+        except Exception:
+            auc = float("nan")
+
+        print(f"\n--- Fold {fold+1}/{n_folds}: "
+              f"训练 {unique_dates[0]}~{unique_dates[test_start_rank-1]}, "
+              f"测试 {test_start_date}~{test_end_date} ---")
+        print(f"  训练样本: {tr_mask.sum():,}  测试样本: {te_mask.sum():,}  "
+              f"正样本比例: {y_tr.mean():.1%} / {y_te.mean():.1%}")
+        print(f"  accuracy={acc:.4f}  precision={prec:.4f}  recall={rec:.4f}  "
+              f"f1={f1:.4f}  auc={auc:.4f}")
+
+        cv_results.append({
+            "fold": fold + 1,
+            "test_dates": f"{test_start_date}~{test_end_date}",
+            "n_train": tr_mask.sum(),
+            "n_test": te_mask.sum(),
+            "train_pos": y_tr.mean(),
+            "test_pos": y_te.mean(),
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "auc": auc,
+        })
+
+    # 汇总
+    if not cv_results:
+        print("无有效折，跳过CV")
+        return None, None
+
+    aucs  = [r["auc"] for r in cv_results]
+    precs = [r["precision"] for r in cv_results]
+    recs  = [r["recall"] for r in cv_results]
+    f1s   = [r["f1"] for r in cv_results]
+
+    print(f"\n{'='*60}")
+    print(f"CV 汇总 (mean ± std)")
+    print(f"{'='*60}")
+    print(f"  AUC:       {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
+    print(f"  Precision: {np.mean(precs):.4f} ± {np.std(precs):.4f}")
+    print(f"  Recall:    {np.mean(recs):.4f} ± {np.std(recs):.4f}")
+    print(f"  F1:        {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+
+    # === 全量数据训练最终模型 ===
+    print(f"\n{'='*60}")
+    print("最终模型（全量数据训练）")
+    print(f"{'='*60}")
+    print(f"总样本: {len(y_all):,}  正样本: {y_all.sum():,} ({y_all.mean():.1%})")
+    print(f"特征维度: {df_feat.shape[1]}")
+
+    scaler = StandardScaler()
+    X_all_s = scaler.fit_transform(X_all)
+
+    model, y_prob_all = _train_one_model(X_all_s, y_all, X_all_s, y_all, n_jobs)
+
+    # 全量数据的训练集分类报告（in-sample，仅供参考）
+    y_pred_all = (y_prob_all >= 0.5).astype(int)
+    print("\n全量样本分类报告 (in-sample，仅供参考):")
+    print(classification_report(y_all, y_pred_all, target_names=["不做T", "做T"]))
     try:
-        print(f"AUC: {roc_auc_score(y_te, y_prob):.4f}")
+        print(f"AUC: {roc_auc_score(y_all, y_prob_all):.4f}")
     except Exception:
         pass
 
@@ -457,21 +575,6 @@ def train(df_feat, labels, df_meta, train_ratio=0.8):
     print("\n特征重要性 (top 15):")
     for name, imp in feat_imp[:15]:
         print(f"  {name:28s}: {imp:.4f}")
-
-    # 择日效果对比（注意：这是标签层的后验估计，不是真实回测）
-    # t_pnl = daily_pnl - (close-open)*base_shares，即当天T操作的净贡献
-    # 此处直接对测试集标签求和，相当于"如果完美知道哪天T净贡献为正"的理论上限
-    # 真实效果请用 compare_monthly.py 验证
-    test_meta = df_meta[te].copy()
-    test_meta["pred"] = y_pred
-    all_t = test_meta["t_pnl"].sum()
-    ml_t  = test_meta[test_meta["pred"] == 1]["t_pnl"].sum()
-    n_all = te.sum()
-    n_ml  = (test_meta["pred"] == 1).sum()
-    print(f"\n[标签层估计（后验，非真实回测）]")
-    print(f"全天做T: {all_t:,.0f}元({n_all}天)  "
-          f"ML择日: {ml_t:,.0f}元({n_ml}天)  "
-          f"减少交易: {n_all - n_ml}/{n_all} 天")
 
     return model, scaler
 
@@ -511,6 +614,7 @@ def main():
         print("没有有效样本，退出。")
         return
     print(f"\n总样本: {len(labels)}  正样本: {labels.sum()} ({labels.mean():.1%})")
+    print(f"标签阈值: t_pnl > {LABEL_THRESHOLD} (|t_pnl| <= {LABEL_THRESHOLD} 已排除)")
     print(f"特征维度: {df_feat.shape[1]}  特征: {df_feat.columns.tolist()}")
 
     # 5. 训练

@@ -36,8 +36,15 @@ venv/bin/python rl/download_data.py --count 50 --start 2026-04-01 --end 2026-06-
 # Download daily K-lines (BaoStock, full HS300, ~3 years)
 venv/bin/python rl/download_daily_baostock.py
 
-# Train ML day-selection model
+# Train ML day-selection model (fast: uses cached stocks only)
+venv/bin/python rl/train_selector.py
+
+# Train ML model (full pipeline: screening + training, 300 stocks)
 venv/bin/python rl/ml_selector.py
+
+# Monthly 3-strategy comparison (all 300 stocks × 30 months)
+venv/bin/python rl/compare_monthly.py
+venv/bin/python rl/compare_monthly.py --rerun --threshold 0.5
 
 # ETF momentum rotation backtest (V1 vs V2 comparison)
 venv/bin/python etf_momentum_rotation.py
@@ -61,9 +68,11 @@ The core backtest pipeline has four layers:
 
 4. **Reporting** (`simulation/report.py`, `simulation/visualize.py`, `simulation/metrics.py`) — `ReportGenerator` prints summary + daily table and exports CSV; `TradingChart` saves PNG to `output/intraday_t/`.
 
-**ML day-selection** (`rl/ml_selector.py`, loaded in `intraday_t_trading.py`): an XGBoost classifier trained on 18 features from the first 6 bars of each morning (amplitude, slope, VWAP deviation, cross-day features from up to 5 prior days). The trained bundle (`model`, `scaler`, `features`) is saved to `rl/models/ml_selector.pkl`. When active, it replaces the trend-filter (both are not run together).
+**ML day-selection** (`rl/ml_selector.py` + `rl/train_selector.py`): an XGBoost classifier with 28 features — 10 morning-bar features (first 6×5min bars), 8 cross-day features (prior 5 days), 10 daily K-line features (amplitude, turnover, PE/PB rank, etc.). Labels are binary: `t_pnl > 50` (positive, "trade") or `t_pnl < -50` (negative, "skip"), with `|t_pnl| <= 50` excluded as noise (~77% of days). Training uses 5-fold expanding-window time-series CV. The bundle (`model`, `scaler`, `features`) lives at `rl/models/ml_selector.pkl`. When active, it replaces the trend-filter.
 
-**Batch comparison** (`rl/compare_strategies.py`): iterates all `data_cache/min_*.parquet` files, runs all three strategies (buy-hold, grid no-ML, grid+ML), and prints a summary table of T-net contribution per stock.
+**T-net contribution (t_pnl)**: defined as `daily_pnl - (close - open) × base_shares` summed per day. This isolates intraday T-trading skill from overnight gaps — the period-level `total_pnl - buy_hold_pnl` would include overnight gaps which T-trading cannot capture.
+
+**Batch comparison** (`rl/compare_strategies.py`): single-period 3-strategy comparison over all cached stocks. `rl/compare_monthly.py` does the same but month-by-month with checkpoint saving, enabling trend analysis across 30 months.
 
 ### ETF Momentum Rotation (`etf_momentum_rotation.py`)
 
