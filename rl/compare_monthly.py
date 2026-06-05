@@ -178,6 +178,23 @@ def _run_symbol_month(args):
         ml_selector = make_ml_selector(_g_model, _g_scaler, _g_feat_cols, daily_df,
                                        threshold=threshold)
 
+        # 预热：加载上个月最后交易日数据，填满历史缓存
+        year, month = int(start[:4]), int(start[5:7])
+        if month > 1:
+            py, pm = year, month - 1
+        else:
+            py, pm = year - 1, 12
+        import calendar
+        prev_last = calendar.monthrange(py, pm)[1]
+        prev_end   = f"{py}-{pm:02d}-{prev_last}"
+        prev_start = f"{py}-{pm:02d}-01"
+        prev_data = load_minute_data(sym, prev_start, prev_end)
+        if prev_data is not None and len(prev_data) > 0:
+            prev_dates = sorted(prev_data["date"].unique())
+            for pd_ in prev_dates[-5:]:
+                prev_day_bars = prev_data[prev_data["date"] == pd_]
+                ml_selector.update_history(prev_day_bars)
+
     try:
         r_no = run_one(sym, data, ml_selector=None)
         r_ml = run_one(sym, data, ml_selector=ml_selector) if ml_selector else None

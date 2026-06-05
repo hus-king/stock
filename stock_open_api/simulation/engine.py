@@ -109,15 +109,13 @@ class SimulationEngine:
                 if fill_ok:
                     strategy.on_fill(pending_signal.side, pending_signal.quantity, fill_price)
 
-            # Closeout: force position back to base_shares only if no pending sells
+            # Closeout: force position back to base_shares at end of each day.
+            # Always execute regardless of pending sells — grid strategy requires
+            # daily position recovery (T+0 constraint).
             last_bar = day_bars.iloc[-1]
             last_time = day_bars.index[-1]
             closeout_price = float(last_bar["close"])
-            pending_sell_qty = sum(
-                e["qty"] for e in getattr(strategy, "_pending_sells", [])
-            )
-            if pending_sell_qty == 0:
-                self._closeout(closeout_price, last_time, day_trades)
+            self._closeout(closeout_price, last_time, day_trades)
 
             strategy.on_day_end()
 

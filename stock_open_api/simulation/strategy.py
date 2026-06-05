@@ -224,6 +224,10 @@ class GridStrategy(BaseStrategy):
             if hasattr(self, "_bars_df") and self._bars_df is not None:
                 morning = self._bars_df.iloc[:6]
                 if not self.ml_selector(morning, self._base_price):
+                    # Clear pending sells from previous days — they should not carry over
+                    # if ML decides to skip (otherwise cross-day state creates asymmetry
+                    # between tag generation and inference)
+                    self._pending_sells.clear()
                     self._skip_day = True
                     return None
 
@@ -297,7 +301,7 @@ class GridStrategy(BaseStrategy):
         self._last_anchor_idx  = 0
         self._intraday_prices  = []
         self._intraday_vols    = []
-        # _pending_sells intentionally kept — unfilled sell orders carry over to next day
+        self._pending_sells.clear()
 
 
 STRATEGY_REGISTRY = {

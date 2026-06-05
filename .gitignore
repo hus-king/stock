@@ -16,11 +16,7 @@ logs/
 venv/
 doc/build/
 
-# 数据缓存（体积大，不提交）
-data_cache/
-
-# 生成的图表和CSV输出
-output/
+# 生成的图表
 *.png
 intraday_t_daily.csv
 intraday_t_daily_trades.csv
